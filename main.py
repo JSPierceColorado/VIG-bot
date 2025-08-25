@@ -1,201 +1,163 @@
 #!/usr/bin/env python3
 """
-Perpetual VIG RSI bot (Alpaca, 4-hour timeframe)
-
-- Fetch CLOSED 4h bars for VIG
-- On each NEWLY CLOSED 4h bar, compute RSI(14)
-- If RSI <= 30: market BUY using 100% of current buying power
+Perpetual VIG RSI bot (Alpaca, 4h)
+- Every minute: fetch CLOSED 4h bars for VIG
+- If RSI(14) <= 30 on a NEWLY CLOSED bar: market BUY using 100% buying power
 - No selling (buy & hold)
-- Plain logs (Railway-friendly)
+- Logs to stdout (Railway-friendly)
 """
 
 import os
-import math
 import time
-import signal
-from decimal import Decimal
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
-# ---- Alpaca SDK ----
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca_trade_api.rest import REST, TimeFrame  # using alpaca_trade_api (your working stack)
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import Adjustment, DataFeed
+# ===== Config (env) =====
+SYMBOL           = os.getenv("SYMBOL", "VIG")
+RSI_LEN          = int(os.getenv("RSI_LEN", "14"))
+RSI_BUY_THRESH   = float(os.getenv("RSI_BUY_THRESH", "30"))
+CHECK_EVERY_SEC  = int(os.getenv("CHECK_EVERY_SEC", "60"))
+MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "10.00"))
+DATA_FEED        = os.getenv("DATA_FEED", "iex").lower()   # 'iex' (default) or 'sip'
 
+# Alpaca creds (same env naming you already use)
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")  # keep your default
 
-# =========================
-# Config (env or defaults)
-# =========================
-SYMBOL                 = os.getenv("SYMBOL", "VIG")
-RSI_LEN                = int(os.getenv("RSI_LEN", "14"))
-RSI_BUY_THRESH         = float(os.getenv("RSI_BUY_THRESH", "30"))
-BARS_LIMIT             = int(os.getenv("BARS_LIMIT", "400"))          # enough history for RSI
-CHECK_EVERY_SEC        = int(os.getenv("CHECK_EVERY_SEC", "60"))      # poll cadence
-BAR_ALIGN_OFFSET_SEC   = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))  # cosmetic; we still gate by bar timestamp
-MIN_NOTIONAL_USD       = Decimal(os.getenv("MIN_NOTIONAL_USD", "10")) # skip dust buys
-DATA_FEED              = os.getenv("DATA_FEED", "IEX").upper()        # IEX (free) or SIP (paid)
-LOG_PREFIX             = os.getenv("LOG_PREFIX", "[vig-rsi4h-bot]")
+if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
+    raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY (or APCA_* equivalents).")
 
-ALPACA_KEY   = os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET= os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1").lower() in ("1", "true", "yes")
-
-if not (ALPACA_KEY and ALPACA_SECRET):
-    raise RuntimeError("Missing ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY env vars.")
+api = REST(key_id=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY, base_url=APCA_API_BASE_URL)
 
 
-# =========================
-# Clients
-# =========================
-trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
-data    = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)  # same creds fine
-
-
-# =========================
-# Logging & signals
-# =========================
-_shutting_down = False
-
+# ===== Utils =====
 def log(msg: str):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    print(f"{LOG_PREFIX} {now} | {msg}", flush=True)
+    print(f"[vig-rsi4h] {now} | {msg}", flush=True)
 
-def _handle(sig, _):
-    global _shutting_down
-    _shutting_down = True
-    log(f"Received {sig}. Shutting down gracefully.")
-signal.signal(signal.SIGTERM, _handle)
-signal.signal(signal.SIGINT, _handle)
-
-
-# =========================
-# Indicators
-# =========================
 def rsi(closes: List[float], length: int = 14) -> float:
-    """Wilder RSI; closes must be oldest→newest CLOSED bars."""
+    """Wilder RSI on closed bars (closes oldest->newest)."""
     if len(closes) < length + 1:
         return float("nan")
-
     gains = losses = 0.0
     for i in range(1, length + 1):
-        d = closes[i] - closes[i - 1]
+        d = closes[i] - closes[i-1]
         gains  += max(d, 0.0)
         losses += max(-d, 0.0)
     avg_gain = gains / length
     avg_loss = losses / length
-
     for i in range(length + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
+        d = closes[i] - closes[i-1]
         gain = max(d, 0.0)
         loss = max(-d, 0.0)
         avg_gain = (avg_gain * (length - 1) + gain) / length
         avg_loss = (avg_loss * (length - 1) + loss) / length
-
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-# =========================
-# Data helpers (4-hour bars)
-# =========================
-TF_4H = TimeFrame(4, TimeFrameUnit.Hour)
-
-def fetch_closed_4h_closes(symbol: str, limit: int) -> Tuple[List[float], Optional[datetime]]:
+# ===== Data helpers =====
+def fetch_closed_4h(api: REST, symbol: str, limit: int = 200):
     """
-    Fetch CLOSED 4h bars (oldest→newest). Returns (closes, last_bar_end_time_utc).
-    last_bar_end_time_utc is the timestamp of the most recent CLOSED 4h bar (DataFrame index).
+    Returns (closes, last_bar_start_utc) for CLOSED 4h bars oldest->newest.
+    We drop a potentially forming last bar by checking its start time.
     """
-    now  = datetime.now(timezone.utc)
-    start = now - timedelta(hours=limit * 4 + 24)  # cushion
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=limit * 4 + 24)
 
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TF_4H,
-        start=start,
-        end=now,
-        adjustment=Adjustment.RAW,
-        feed=DataFeed.SIP if DATA_FEED == "SIP" else DataFeed.IEX
+    # get_bars returns BarsV2 with .df (MultiIndex: symbol,timestamp)
+    bars = api.get_bars(
+        symbol,
+        "4Hour",  # string form is safe across versions
+        start=start.isoformat(),
+        end=now.isoformat(),
+        adjustment="raw",
+        feed=DATA_FEED,
+        limit=limit + 5,
     )
-    bars = data.get_stock_bars(req)
-    df = bars.df
+
+    df = getattr(bars, "df", None)
     if df is None or df.empty:
         return [], None
 
+    # if MultiIndex, slice symbol; else assume single-index
     try:
         sym_df = df.xs(symbol, level=0)
     except Exception:
         sym_df = df
 
-    # sym_df index is pandas.DatetimeIndex (tz-aware UTC from Alpaca)
+    # Ensure chronological order
+    sym_df = sym_df.sort_index()
+
+    # Drop a potentially forming last bar:
+    # Alpaca timestamps are bar START times; a 4h bar is "closed"
+    # only if start <= now - 4h.
+    if not sym_df.empty and sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc) > (now - timedelta(hours=4)):
+        sym_df = sym_df.iloc[:-1]
+
+    if sym_df.empty:
+        return [], None
+
     closes = sym_df["close"].astype(float).tolist()
-    last_ts = sym_df.index[-1].to_pydatetime()
-    if last_ts.tzinfo is None:
-        last_ts = last_ts.replace(tzinfo=timezone.utc)
-
-    return (closes[-limit:] if len(closes) > limit else closes, last_ts)
+    last_start = sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)
+    return closes, last_start
 
 
-# =========================
-# Trading helpers
-# =========================
-def get_buying_power() -> Decimal:
-    acct = trading.get_account()
-    return Decimal(acct.buying_power)
+def get_buying_power_usd(api: REST) -> float:
+    acct = api.get_account()
+    try:
+        return float(acct.buying_power)
+    except Exception:
+        return float(acct.cash)
 
-def buy_with_notional(symbol: str, notional: Decimal):
-    """Place a market BUY using USD notional (TIF=DAY)."""
-    req = MarketOrderRequest(
+
+def buy_all_buying_power(api: REST, symbol: str, notional_usd: float):
+    client_order_id = f"buy-{symbol}-{int(time.time()*1000)}"
+    order = api.submit_order(
         symbol=symbol,
-        notional=float(notional),
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY
+        side="buy",
+        type="market",
+        time_in_force="day",
+        notional=round(notional_usd, 2),
+        client_order_id=client_order_id,
     )
-    resp = trading.submit_order(req)
-    oid = getattr(resp, "id", None) or getattr(resp, "client_order_id", None)
-    log(f"{symbol} | BUY market notional=${notional} (order_id={oid})")
+    oid = getattr(order, "id", "") or getattr(order, "client_order_id", "")
+    status = getattr(order, "status", "submitted")
+    log(f"{symbol} | BUY ${notional_usd:.2f} submitted (order {oid}, status {status})")
 
 
-# =========================
-# Main loop
-# =========================
+# ===== Main loop =====
 def main():
-    log(f"Starting VIG 4h RSI bot: RSI{RSI_LEN} ≤ {RSI_BUY_THRESH} → BUY 100% buying power | feed={DATA_FEED} | paper={ALPACA_PAPER}")
+    log(f"Starting VIG 4h RSI bot | base={APCA_API_BASE_URL} | feed={DATA_FEED}")
     last_seen_bar: Optional[datetime] = None
 
-    # small delay so we’re not racing bar close; not critical since we gate by timestamp
-    time.sleep(BAR_ALIGN_OFFSET_SEC)
-
-    while not _shutting_down:
+    while True:
         try:
-            closes, last_bar = fetch_closed_4h_closes(SYMBOL, BARS_LIMIT)
-            if not closes or last_bar is None:
-                log(f"{SYMBOL} | No bars returned (market closed or data delay).")
+            closes, last_bar_start = fetch_closed_4h(api, SYMBOL, limit=max(200, RSI_LEN + 50))
+            if not closes or last_bar_start is None:
+                log(f"{SYMBOL} | No closed 4h bars yet (market closed or data delay).")
             else:
-                same_bar = (last_seen_bar is not None and last_bar == last_seen_bar)
                 r = rsi(closes, RSI_LEN)
-                bp = get_buying_power()
+                bp = get_buying_power_usd(api)
                 px = closes[-1]
-                log(f"{SYMBOL} | 4h RSI{RSI_LEN}={r:.2f} | price={px:.4f} | buying_power=${bp} | bar_close={last_bar.isoformat()} | {'same 4h bar' if same_bar else 'new 4h bar'}")
+                is_new_bar = (last_seen_bar is None) or (last_bar_start != last_seen_bar)
+                log(f"{SYMBOL} | 4h RSI{RSI_LEN}={r:.2f} | price={px:.4f} | buying_power=${bp:.2f} | bar_start={last_bar_start.isoformat()} | {'NEW' if is_new_bar else 'same'}")
 
-                # Only act ONCE per newly closed 4h bar
-                if not same_bar and r <= RSI_BUY_THRESH and bp >= MIN_NOTIONAL_USD:
-                    buy_with_notional(SYMBOL, bp.quantize(Decimal('0.01')))
-                    last_seen_bar = last_bar
-                elif not same_bar:
-                    # update the gate even if no buy (so we don't re-log as "new bar" next loop)
-                    last_seen_bar = last_bar
+                if is_new_bar and r <= RSI_BUY_THRESH and bp >= MIN_NOTIONAL_USD:
+                    buy_all_buying_power(api, SYMBOL, bp)
+                    last_seen_bar = last_bar_start
+                elif is_new_bar:
+                    # update even if no buy, so we don't spam "NEW"
+                    last_seen_bar = last_bar_start
 
         except Exception as e:
-            log(f"Error: {e}")
+            log(f"Error: {type(e).__name__}: {e}")
 
-        # Poll cadence; we’ll fire only when a new 4h bar appears
         time.sleep(CHECK_EVERY_SEC)
 
 
