@@ -1,0 +1,2 @@
+alpaca-py>=0.18
+pandas>=1.5
